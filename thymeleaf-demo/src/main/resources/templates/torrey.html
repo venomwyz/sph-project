@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <title>Title</title>
+</head>
+<body>
+
+<h1>欢迎登录</h1>
+
+<table>
+    <th>序号</th>
+    <th>id</th>
+    <th>名字</th>
+    <th>地址</th>
+    <tr th:each="user,abcd:${userList}">
+        <td th:text="${abcd.count}"></td>
+        <td th:text="${user.id}"></td>
+        <td th:text="${user.name}"></td>
+        <td th:text="${user.age}"></td>
+    </tr>
+</table>
+
+<div th:text="${#dates.format(date,'yyyy/MM/dd HH:mm:ss')}"></div>
+
+<div th:if="${if1} >=18">
+    成年
+</div>
+<div th:unless="${if1} >=18">
+    hh未成年
+</div>
+
+<div th:each="map:${hashMap}">
+    <div th:text="${map.key}"></div>
+    <div th:text="${map.value}"></div>
+</div>
+
+<div th:if="${#maps.containsKey(hashMap,'aa')}">
+    包含
+</div>
+<div th:unless="${#maps.containsKey(hashMap,'aa')}">
+    no
+</div>
+
+<!--切分字符串-->
+
+<div th:text="${#strings.replace(to2,'2','')}"></div>
+
+<div th:text="${#strings.substring(to2,2)}"></div>
+<div th:text="${#strings.substring(to3,2)}"></div>
+<div th:text="${#strings.substring(to3,2,4)}"></div>
+
+<!--数字循环-->
+<div th:each="i:${#numbers.sequence(1,10,1)}">
+    <div th:text="${i}"></div>
+</div>
+
+<a th:href="@{${url}(name='111',age='16')}">jump</a>
+
+
+
+
+
+
+</body>
+</html>
