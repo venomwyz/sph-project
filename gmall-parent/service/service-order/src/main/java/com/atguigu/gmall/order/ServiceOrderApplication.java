@@ -9,7 +9,7 @@ import org.springframework.context.annotation.ComponentScan;
 
 @SpringBootApplication
 @ComponentScan("com.atguigu.gmall")
-@EnableFeignClients({"com.atguigu.gmall.cart.feign","com.atguigu.gmall.product.client"})
+@EnableFeignClients({"com.atguigu.gmall.cart.feign","com.atguigu.gmall.product.client","com.atguigu.gmall.payment.client"})
 @EnableDiscoveryClient
 @ServletComponentScan("com.atguigu.gmall.order.filter")
 public class ServiceOrderApplication {

@@ -41,4 +41,15 @@ public class OrderController {
         return Result.ok();
     }
 
+    /**
+     * 获取渠道信息
+     *
+     */
+    @GetMapping("getOrderPayInfo")
+    public Result getUrlMsg(String orderId,String paywey){
+        String payment = orderService.getPayment(orderId, paywey);
+        return Result.ok(payment);
+
+    }
+
 }

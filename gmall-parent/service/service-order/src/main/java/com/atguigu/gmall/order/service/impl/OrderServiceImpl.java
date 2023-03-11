@@ -7,10 +7,13 @@ import com.atguigu.gmall.model.enums.OrderStatus;
 import com.atguigu.gmall.model.enums.ProcessStatus;
 import com.atguigu.gmall.model.order.OrderDetail;
 import com.atguigu.gmall.model.order.OrderInfo;
+import com.atguigu.gmall.model.payment.PaymentInfo;
 import com.atguigu.gmall.order.mapper.OrderDetailMapper;
 import com.atguigu.gmall.order.mapper.OrderMapper;
+import com.atguigu.gmall.order.mapper.PaymentInfoMapper;
 import com.atguigu.gmall.order.service.OrderService;
 import com.atguigu.gmall.order.util.OrderThreadLocalUtil;
+import com.atguigu.gmall.payment.client.PaymentFegin;
 import com.atguigu.gmall.product.client.ProductFeignClient;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import lombok.extern.log4j.Log4j2;
@@ -26,9 +29,7 @@ import org.springframework.util.StringUtils;
 
 import javax.annotation.Resource;
 import java.math.BigDecimal;
-import java.util.Date;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
@@ -51,6 +52,8 @@ public class OrderServiceImpl implements OrderService {
     private ProductFeignClient productFeignClient;
     @Autowired
     private RabbitTemplate rabbitTemplate;
+    @Autowired
+    private PaymentFegin paymentFegin;
     /**
      * 添加订单与详情
      *
@@ -106,7 +109,7 @@ public class OrderServiceImpl implements OrderService {
                                 id+"",
                                 (message -> {
                                     MessageProperties messageProperties = message.getMessageProperties();
-                                    messageProperties.setExpiration(20000+"");
+                                    messageProperties.setExpiration(2000000+"");
                                     return message;
 
                                 }));
@@ -172,11 +175,11 @@ public class OrderServiceImpl implements OrderService {
         if (orderId==null){
             return;
         }
-        RLock lock = redissonClient.getLock("Cancle_Order_" + orderId);
+        RLock lock = redissonClient.getLock("pay_cancel_orderId_" + orderId);
         try {
             if (lock.tryLock()){
                 try {
-                    redisTemplate.expire("Cancle_Order_" + orderId,10,TimeUnit.SECONDS);
+                    redisTemplate.expire("pay_cancel_orderId_" + orderId,10,TimeUnit.SECONDS);
                     //判断是主动取消还是被动取消
                     LambdaQueryWrapper<OrderInfo> queryWrapper = new LambdaQueryWrapper<>();
                     queryWrapper
@@ -220,6 +223,8 @@ public class OrderServiceImpl implements OrderService {
 
     }
 
+
+
     /**
      * 回退库存
      * @param orderId
@@ -238,5 +243,147 @@ public class OrderServiceImpl implements OrderService {
        if (!productFeignClient.rollbackCart(map)){
            throw new RuntimeException("在订单业务中数据库回滚失败");
        }
+    }
+
+    /**
+     * 获取微信的支付信息:安照收到的支付结果，无条件的修改为支付
+     *
+     * @param resultPay
+     */
+    @Override
+    public void updatePayStatus(String resultPay) {
+        //校验
+        if (StringUtils.isEmpty(resultPay)){
+            return;
+        }
+
+        //将信息转换为对象
+        Map<String,String> map = JSONObject.parseObject(resultPay, Map.class);
+        //获取订单号
+        String orderId = map.get("out_trade_no");
+        //防止并发
+        RLock lock = redissonClient.getLock("pay_cancel_orderId_" + orderId);
+        try {
+            lock.lock();
+                try {
+                    //查询数据库，修改状态
+                    OrderInfo orderInfo = orderMapper.selectById(orderId);
+                    //修改状态--修改为已经支付
+                    if (orderInfo.getOrderStatus().equals(OrderStatus.UNPAID.getComment())){
+
+                        orderInfo.setOrderStatus(OrderStatus.PAID.getComment());
+                        orderInfo.setProcessStatus(OrderStatus.PAID.getComment());
+                        //添加其他两个字段
+                        orderInfo.setOutTradeNo(map.get("transaction_id"));
+                        orderInfo.setTradeBody(resultPay);
+                        int update = orderMapper.updateById(orderInfo);
+                        if (update<0){
+                            throw new RuntimeException("修改失败");
+                        }
+                        //用户点击取消或者是超时取消，但是这时用户又将钱付了，就必须将取消改为为已经支付,然后进行退款
+                    }else if (orderInfo.getOrderStatus().equals(OrderStatus.ACT_CANCLE.getComment()) ||
+                            orderInfo.getOrderStatus().equals(OrderStatus.TIMEOUT_CANCLE.getComment())) {
+                        //调用方法
+                        Map<String, String> hashMap = getStringStringMap(orderId, orderInfo,map.get("paywey"));
+
+                        rabbitTemplate
+                                .convertAndSend("return_exchange", "returnWx", JSONObject.toJSONString(hashMap));
+                        //若订单为已支付状态,判断是否重复支付!!(多渠道都去支付了), 判断本次支付的渠道和数据库保存的渠道是否一致
+                    }else if (orderInfo.getOrderStatus().equals(OrderStatus.PAID.getComment())){
+                        //获取信息
+                        PaymentInfo paymentInfo =
+                                paymentInfoMapper.selectOne(
+                                        new LambdaQueryWrapper<PaymentInfo>()
+                                                .eq(PaymentInfo::getOrderId, orderId)
+                                                .eq(PaymentInfo::getIsDelete, 1));
+                        if (!paymentInfo.getPaymentType().equals(map.get("payway"))) {
+                            Map<String, String> reMap = getStringStringMap(orderId, orderInfo, map.get("paywey"));
+
+                        }
+                    }
+                }catch (Exception exception){
+                    log.error("加锁成功，业务执行失败");
+                }finally {
+                    lock.unlock();
+                }
+
+        }catch (Exception e){
+            log.error("加锁失败");
+        }
+
+    }
+
+    private Map<String, String> getStringStringMap(String orderId, OrderInfo orderInfo,String payway) {
+        //生成退款需要的字段
+        String replace = UUID.randomUUID().toString().replace("-", "");
+        Map<String, String> hashMap = new HashMap<>();
+        hashMap.put("refundNo", replace);
+        hashMap.put("orderId", orderId);
+        hashMap.put("acount", orderInfo.getTotalAmount()
+                .multiply(new BigDecimal(100)).intValue() + "");
+        return hashMap;
+    }
+
+    @Resource
+private PaymentInfoMapper paymentInfoMapper;
+
+    /**
+     * 判断用户支付的渠道，目的是为了知道用户多渠道支付，造成的重复支付后果
+     * ，这也是用户支付的第一步
+     *  @param orderId
+     * @param paywey
+     * @return
+     */
+    @Override
+    public PaymentInfo getPayment(String orderId, String paywey) {
+        if (StringUtils.isEmpty(orderId) || StringUtils.isEmpty(paywey)){
+            return null;
+        }
+
+        //获取旧的,有的话返回,没有去找渠道申请
+        PaymentInfo paymentInfo =
+                (PaymentInfo) redisTemplate.opsForValue().get("Order_Pay_Url_" + orderId);
+        if(paymentInfo != null && paymentInfo.getId() != null){
+            return paymentInfo;
+        }
+        //加锁,保证同一个订单在同一个时间只能选择一个支付渠道--->5分钟才能换渠道!
+            Boolean aBoolean = redisTemplate.opsForValue().setIfAbsent("Pay_return_Url_" + orderId, "123", 300, TimeUnit.SECONDS);
+            //查询订单信息，目的是用户将订单信息传过去
+            if (aBoolean){
+                LambdaQueryWrapper<OrderInfo> queryWrapper = new LambdaQueryWrapper<>();
+                queryWrapper.eq(OrderInfo::getUserId,OrderThreadLocalUtil.get())
+                        .eq(OrderInfo::getId,orderId);
+                OrderInfo orderInfo = orderMapper.selectOne(queryWrapper);
+
+                //使用feign调用
+                Map<String, String> uiui = paymentFegin.getUrl("uiui", orderId, orderInfo.getTotalAmount().multiply(new BigDecimal(100)).intValue() + "");
+                //判断是否成功获取二维码及相关信息
+                if(uiui.get("return_code").equals("SUCCESS") &&
+                        uiui.get("result_code").equals("SUCCESS")){
+                    String codeUrl = uiui.get("code_url");
+
+                    paymentInfo = new PaymentInfo();
+                    paymentInfo.setPayUrl(codeUrl);
+                    paymentInfo.setOrderId(orderId);
+                    paymentInfo.setPaymentType(paywey);
+                    paymentInfo.setTotalAmount(orderInfo.getTotalAmount());
+                    paymentInfo.setSubject("尚硅谷商城");
+                    paymentInfo.setPaymentStatus(OrderStatus.UNPAID.getComment());
+                    paymentInfo.setCreateTime(new Date());
+                    //保存: 先逻辑删除数据的,在新增
+                    if(paymentInfoMapper.deletePaymentInfo(orderId) > 0 &&
+                            paymentInfoMapper.insert(paymentInfo) > 0){
+                        redisTemplate.opsForValue().set("Pay_return_Url_" + orderId,paymentInfo);
+
+                    }else {
+                        //把key删除,防止用户不能申请渠道
+                        redisTemplate.delete("Order_Pay_Url_" + orderId);
+                    }
+                    //成功获取才能返回支付二维码地址
+                    return paymentInfo;
+
+                }
+            }
+            return null;
     }
 }
